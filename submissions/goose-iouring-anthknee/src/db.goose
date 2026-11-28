@@ -8,7 +8,6 @@ namespace db;
 enum Lookup { Found, Missing, Failed }
 enum Like { Created, Existing, Missing, Failed }
 enum Plan { Ready, Fallback, Failed }
-enum Checkpoint { Idle, Active { started: i64 } }
 
 let POSTS: i32 = 0;
 let USERS: i32 = 1;
@@ -23,7 +22,13 @@ var order: i64[20];
 var row_count: i64 = 0;
 var counts: u32[513];
 var text: u8[>..];
-var checkpoint: Checkpoint = Checkpoint.Idle;
+var checkpoint_running: bool = false;
+var checkpoint_hold_until: i64 = 0;
+var checkpoint_retry_at: i64 = 0;
+let WAL_INTERVAL: i64 = 4096;
+let WAL_LIMIT: i64 = 65536;
+let WAL_CATCHUP: i64 = WAL_LIMIT * 3 / 4;
+let WAL_TAIL: i64 = 256;
 
 fn count_slow(id: i64) -> i64 {
     var cursor = native::seek_ge(LIKES, id);
@@ -250,31 +255,26 @@ fn like(uid: i64, id: i64) -> Like {
 }
 
 fn writes_held() -> bool {
-    return match checkpoint { Idle => false, Active => true };
+    return checkpoint_hold_until != 0 || native::wal_frames() >= WAL_LIMIT;
 }
 
 fn tick(now: i64) {
-    let status = native::checkpoint_poll();
-    let frames = native::wal_frames();
-    match checkpoint {
-        Idle => {
-            if frames >= 4096 {
-                checkpoint = Checkpoint.Active { started: now };
-                native::checkpoint_request();
-            }
-        },
-        Active a => {
-            if status >= 2 {
-                if status == 2 { native::wal_reset(); }
-                if status != 2 && frames >= 65536 {
-                    checkpoint = Checkpoint.Active { started: now };
-                    native::checkpoint_request();
-                } else {
-                    checkpoint = Checkpoint.Idle;
-                }
-            } else if frames < 65536 && now - a.started >= 250000 {
-                native::checkpoint_interrupt();
-            }
-        },
+    if checkpoint_running {
+        if now >= checkpoint_hold_until { checkpoint_hold_until = 0; }
+        let status = native::checkpoint_poll();
+        if status == 0 { return; }
+        checkpoint_running = false;
+        checkpoint_hold_until = 0;
+        if status == 1 { checkpoint_retry_at = now + 16000; }
     }
+    if now < checkpoint_retry_at { return; }
+    let frames = native::wal_frames();
+    let remaining = native::wal_remaining();
+    let restart = frames >= WAL_LIMIT && remaining == 0;
+    if !restart && (remaining == 0 || (frames < WAL_CATCHUP && remaining < WAL_INTERVAL)) { return; }
+    if frames >= WAL_CATCHUP && remaining > 0 && remaining <= WAL_TAIL {
+        checkpoint_hold_until = now + 16000;
+    }
+    checkpoint_running = true;
+    native::checkpoint_request(restart);
 }

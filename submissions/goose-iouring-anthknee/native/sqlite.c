@@ -79,7 +79,6 @@ static int anth_pc_install(void) {
 
 /* WAL coalescing from PR #263. Readers need the complete commit frame when SQLite publishes it. */
 #define ANTH_WAL_CAP 0x1ffff /* unix VFS write-size limit */
-#define ANTH_CKPT_CAP (64 * 1024)
 #define ANTH_VFS "anthknee-wal"
 typedef struct {
   sqlite3_file base;
@@ -87,7 +86,6 @@ typedef struct {
   unsigned char *bytes;
   sqlite3_int64 offset, end;
   int length, page_size, is_wal, expect_page, commit, error;
-  bool full_checkpoint, group_pages;
 } anth_file;
 static sqlite3_vfs *anth_vfs_base;
 
@@ -127,22 +125,6 @@ static int anth_f_read(sqlite3_file *p, void *data, int n, sqlite3_int64 off) {
 }
 static int anth_f_write(sqlite3_file *p, const void *data, int n, sqlite3_int64 off) {
   anth_file *f = AF(p);
-  if (f->group_pages) {
-    if (f->error) return f->error;
-    if (n > 0 && n < ANTH_CKPT_CAP) {
-      if (f->length && (off != f->offset + f->length || f->length + n > ANTH_CKPT_CAP ||
-                        f->length >= 16 * n)) AF_FLUSH(p);
-      if (!f->bytes) f->bytes = sqlite3_malloc(ANTH_CKPT_CAP);
-      if (f->bytes) {
-        if (!f->length) f->offset = off;
-        memcpy(f->bytes + f->length, data, (size_t)n);
-        f->length += n;
-        return SQLITE_OK;
-      }
-    }
-    AF_FLUSH(p);
-    f->group_pages = false;
-  }
   if (!f->is_wal) return f->real->pMethods->xWrite(f->real, data, n, off);
   if (f->error) return f->error;
   int header = f->page_size && n == 24 && off == f->end && off >= 32 &&
@@ -191,8 +173,6 @@ static int anth_f_reserved(sqlite3_file *p, int *out) {
   AF_FLUSH(p); return AF(p)->real->pMethods->xCheckReservedLock(AF(p)->real, out);
 }
 static int anth_f_control(sqlite3_file *p, int op, void *arg) {
-  if (op == SQLITE_FCNTL_CKPT_START) AF(p)->group_pages = AF(p)->full_checkpoint;
-  if (op == SQLITE_FCNTL_CKPT_DONE) AF(p)->group_pages = false;
   AF_FLUSH(p); return AF(p)->real->pMethods->xFileControl(AF(p)->real, op, arg);
 }
 static int anth_f_sector(sqlite3_file *p) { return AF(p)->real->pMethods->xSectorSize(AF(p)->real); }
@@ -257,7 +237,8 @@ static KeyInfo *keys[NTREES];
 static BtCursor *curs[NTREES];
 static bool tx_open, tx_lost;
 static sqlite3_stmt *q_begin, *q_commit, *q_rollback, *q_post, *q_like, *q_ping, *q_feed;
-static volatile int wal_size;
+static int wal_size, wal_copied;
+static u32 wal_salt;
 
 static void say(gs_rref err, const char *what) {
   const char *m = conn ? sqlite3_errmsg(conn) : "no database";
@@ -267,7 +248,9 @@ static void say(gs_rref err, const char *what) {
 }
 
 static int on_wal(void *u, sqlite3 *d, const char *n, int frames) {
-  (void)u; (void)d; (void)n;
+  (void)u; (void)n;
+  u32 salt = d->aDb[0].pBt->pBt->pPager->pWal->hdr.aSalt[0];
+  if (salt != wal_salt) { wal_salt = salt; wal_copied = 0; }
   wal_size = frames;
   return SQLITE_OK;
 }
@@ -297,20 +280,14 @@ static KeyInfo *index_keys(int nkey, bool desc) {
 static sqlite3 *ck_conn;
 static pthread_mutex_t ck_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t ck_wake = PTHREAD_COND_INITIALIZER;
-static int ck_asked;
-static int ck_status;          /* 0 idle, 1 running, 2 complete, 3 frames remain */
+static bool ck_asked, ck_restart, ck_done;
+static u32 ck_salt;
+static int ck_rc, ck_log, ck_copied;
 static int ck_quit;
 static pthread_t ck_worker;
 
-/* A busy lock can leave a partial checkpoint without a final sync to flush buffered pages. */
-static int ck_busy(void *arg, int attempts) {
-  (void)attempts;
-  AF(arg)->full_checkpoint = false;
-  return 0;
-}
-
 static void *ck_thread(void *arg) {
-  anth_file *file = AF(arg);
+  (void)arg;
 #ifdef __linux__
   if (setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 10)) perror("checkpoint nice");
 #endif
@@ -318,40 +295,40 @@ static void *ck_thread(void *arg) {
     pthread_mutex_lock(&ck_lock);
     while (!ck_asked && !ck_quit) pthread_cond_wait(&ck_wake, &ck_lock);
     if (ck_quit) { pthread_mutex_unlock(&ck_lock); return NULL; }
-    ck_asked = 0;
+    int mode = ck_restart ? SQLITE_CHECKPOINT_RESTART : SQLITE_CHECKPOINT_PASSIVE;
+    ck_asked = false;
     pthread_mutex_unlock(&ck_lock);
-    int in_log = -1, copied = -1;
-    file->full_checkpoint = true;
-    int rc = sqlite3_wal_checkpoint_v2(ck_conn, "main", SQLITE_CHECKPOINT_FULL, &in_log, &copied);
-    /* A buffered write error from xTruncate prevents SQLite from advancing a full checkpoint. */
-    assert(!file->error || rc != SQLITE_OK);
-    file->full_checkpoint = file->group_pages = false;
-    file->length = file->error = 0;
-    __atomic_store_n(&ck_status, rc == SQLITE_OK && in_log >= 0 && in_log == copied ? 2 : 3, __ATOMIC_RELEASE);
+    ck_rc = sqlite3_wal_checkpoint_v2(ck_conn, "main", mode, &ck_log, &ck_copied);
+    __atomic_store_n(&ck_done, true, __ATOMIC_RELEASE);
   }
   return 0;
 }
 
-void sd_checkpoint_request(void) {
-  if (__atomic_load_n(&ck_status, __ATOMIC_ACQUIRE) == 1) return;
-  __atomic_store_n(&ck_status, 1, __ATOMIC_RELEASE);
+void sd_checkpoint_request(uint8_t restart) {
+  ck_salt = wal_salt;
+  __atomic_store_n(&ck_done, false, __ATOMIC_RELAXED);
   pthread_mutex_lock(&ck_lock);
-  ck_asked = 1;
+  ck_restart = restart;
+  ck_asked = true;
   pthread_cond_signal(&ck_wake);
   pthread_mutex_unlock(&ck_lock);
 }
 
-void sd_checkpoint_interrupt(void) { sqlite3_interrupt(ck_conn); }
-
 int32_t sd_checkpoint_poll(void) {
-  int s = __atomic_load_n(&ck_status, __ATOMIC_ACQUIRE);
-  if (s >= 2) __atomic_store_n(&ck_status, 0, __ATOMIC_RELEASE);
-  return s;
+  if (!__atomic_load_n(&ck_done, __ATOMIC_ACQUIRE)) return 0;
+  if ((ck_rc != SQLITE_OK && ck_rc != SQLITE_BUSY) || ck_salt != wal_salt ||
+      ck_log < 0 || ck_log > wal_size || ck_copied < 0 || ck_copied > ck_log) return 1;
+  if (ck_restart && ck_rc == SQLITE_OK && ck_log == wal_size && ck_copied == ck_log) {
+    wal_size = wal_copied = 0;
+    return 2;
+  }
+  if (ck_copied <= wal_copied) return 1;
+  wal_copied = ck_copied;
+  return 2;
 }
 
 int64_t sd_wal_frames(void) { return wal_size; }
-
-void sd_wal_reset(void) { wal_size = 0; }
+int64_t sd_wal_remaining(void) { return wal_size - wal_copied; }
 
 int32_t sd_open(bytes_t path_b, gs_rref err) {
   char path[4096], got[256];
@@ -428,17 +405,11 @@ int32_t sd_open(bytes_t path_b, gs_rref err) {
     say(err, "checkpoint connection");
     return -1;
   }
-  sqlite3_file *ck_file = NULL;
-  if (sqlite3_file_control(ck_conn, "main", SQLITE_FCNTL_FILE_POINTER, &ck_file) != SQLITE_OK ||
-      !ck_file || ck_file->pMethods != &anth_file_methods ||
-      sqlite3_busy_handler(ck_conn, ck_busy, ck_file) != SQLITE_OK) {
-    say(err, "checkpoint VFS"); return -1;
-  }
   pthread_attr_t a;
   int thread_rc = pthread_attr_init(&a);
   if (!thread_rc) {
     thread_rc = pthread_attr_setstacksize(&a, 256 << 10);
-    if (!thread_rc) thread_rc = pthread_create(&ck_worker, &a, ck_thread, ck_file);
+    if (!thread_rc) thread_rc = pthread_create(&ck_worker, &a, ck_thread, NULL);
     int destroy_rc = pthread_attr_destroy(&a);
     if (destroy_rc) {
       fprintf(stderr, "checkpoint attributes: %s\n", strerror(destroy_rc));

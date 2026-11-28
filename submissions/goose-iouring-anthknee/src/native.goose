@@ -53,9 +53,8 @@ extern fn add_post(uid: i64, text: const u8[:], id: i64&, created: u8[>..]&) -> 
 extern fn add_like(uid: i64, id: i64) -> i32 = "sd_add_like";
 extern fn ping(err: u8[>..]&) -> i32 = "sd_ping";
 extern fn feed_step(row: FeedRow&, text: u8[>..]&) -> i32 = "sd_feed_step";
-extern fn checkpoint_request() = "sd_checkpoint_request";
-extern fn checkpoint_interrupt() = "sd_checkpoint_interrupt";
+extern fn checkpoint_request(restart: bool) = "sd_checkpoint_request";
 extern fn checkpoint_poll() -> i32 = "sd_checkpoint_poll";
 extern fn wal_frames() -> i64 = "sd_wal_frames";
-extern fn wal_reset() = "sd_wal_reset";
+extern fn wal_remaining() -> i64 = "sd_wal_remaining";
 extern fn shutdown() = "sd_shutdown";

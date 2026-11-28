@@ -27,7 +27,7 @@ SQLITE_PATH=/path/to/feed-copy.db JWT_SECRET=twelve-dollar-challenge \
 
 - Posts and likes share a 16 ms write window and reuse prepared statements. Reads can continue. Replies that depend on a write wait for commit.
 - SQLite uses WAL with `synchronous=NORMAL` and a 128 MiB page cache target. The file adapter combines adjacent WAL writes. The page cache skips scans that would remove nothing.
-- During a full checkpoint, reads continue and new writes pause. A low-priority worker groups up to 16 adjacent pages per write (64 KiB maximum). Lock contention switches it to individual writes. Below 65,536 WAL frames, the server asks a checkpoint still running after 250 ms to stop.
+- A low-priority worker copies WAL frames with passive checkpoints while reads and writes continue. At 49,152 frames it runs catch-up passes. For the last 256 frames it can pause new writes for up to 16 ms so SQLite can reuse the log. At 65,536 frames, new writes wait until SQLite confirms the log can restart.
 
 ### Connections and memory
 
