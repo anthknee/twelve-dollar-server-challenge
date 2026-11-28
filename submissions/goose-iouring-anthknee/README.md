@@ -32,7 +32,7 @@ SQLITE_PATH=/path/to/feed-copy.db JWT_SECRET=twelve-dollar-challenge \
 ### Connections and memory
 
 - Eight `SO_REUSEPORT` listeners enable `TCP_NODELAY`. Multishot accepts and receives reduce system calls. Each ring has fixed socket slots and 1,024 shared 2 KiB buffers. More rings open as slots fill.
-- The event loop batches I/O and buffer returns, rotates between rings and checks the others before waiting on the primary ring. Queues advance by index and older requests get time each pass. Nonblocking reads drain sockets when receive buffers run out. When the request budget runs out, committed replies go out before the next round of reads. [Event loop](src/transport.goose)
+- The event loop rotates between rings and takes up to 128 completions from each per turn. It serves ready reads, then commits up to 128 queued writes. During a backlog it submits replies before the next group. An overdue write group can run again on the next turn. Nonblocking reads recover sockets when receive buffers run out. [Event loop](src/transport.goose)
 - A connection record uses 29 bytes on Linux x86-64. Idle connections need no private request buffer. Queued input and replies reuse buffers by size. Input beyond the 6 MiB native pool uses exact-sized Goose slices within a combined 256 MiB budget. The server tries to keep its code in RAM and release unused heap pages after bursts. [Buffer pools](src/input_buffers.goose) · [Native I/O](native/io.h)
 
 ### Parsing and compilation

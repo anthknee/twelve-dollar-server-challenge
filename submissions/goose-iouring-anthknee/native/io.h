@@ -329,7 +329,7 @@ static inline int32_t io_submit_pending(void) {
   }
   return 0;
 }
-static inline void io_reap(int32_t ri, gs_rref out) {
+static inline uint8_t io_reap(int32_t ri, uint32_t limit, gs_rref out) {
   io_ring *ring = io_rings[ri];
   struct io_uring_cqe *entry;
   unsigned head, count = 0;
@@ -337,8 +337,10 @@ static inline void io_reap(int32_t ri, gs_rref out) {
     uint8_t *p = (uint8_t *)out.stk->top;
     memcpy(p, &entry->user_data, 8); memcpy(p + 8, &entry->res, 4); memcpy(p + 12, &entry->flags, 4);
     out.stk->top += 16; out.hdr->len++; count++;
+    if (count == limit) break;
   }
   io_uring_cq_advance(&ring->queue, count);
+  return count == limit && io_uring_cq_ready(&ring->queue) > 0;
 }
 static inline void io_return(int32_t ri, int32_t buffer) {
   assert(buffer >= 0 && buffer < IO_RX);

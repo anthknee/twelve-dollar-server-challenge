@@ -20,6 +20,8 @@ let AGAIN: i32 = -11;
 let ALREADY: i32 = -114;
 let NO_BUFFERS: i32 = -105;
 let WRITE_WINDOW_US: i64 = 16000;
+let WRITE_BATCH: i64 = 128;
+let RING_TURN: u32 = 128;
 
 struct Ring { open: i64, reads: i64, accepting: bool[8], cancelling: bool[8] }
 var connections: model::Connection[>..];
@@ -30,6 +32,7 @@ var accept_ring: i64 = 0;
 var margin: i64 = 0;
 var retry_at: i64 = 0;
 var answers_left: i64 = 0;
+var more_completions: bool = false;
 var started: i64 = 0;
 var completions: native::Cqe[>..];
 var ready: model::Handle[>..<];
@@ -164,7 +167,17 @@ fn serve(index: i64, bytes: const u8[:], floor: i64, allow_writes: bool) {
     var offset = 0;
     while offset < bytes.len {
         let remaining = bytes[offset..];
-        if answers_left <= floor { stash(index, remaining, 1); return; }
+        if answers_left <= floor {
+            if allow_writes {
+                match http::parse(remaining) {
+                    Complete p => {
+                        if p.request.method == model::Method.Post { stash(index, remaining, 2); return; }
+                    },
+                    _ => {},
+                }
+            }
+            stash(index, remaining, 1); return;
+        }
         let result = http::parse(remaining);
         match result {
             NeedMore => { stash(index, remaining, 0); return; },
@@ -322,7 +335,10 @@ fn cancel_accept(ring: i64, listener: i64) {
 }
 
 fn drain(ring: i64) {
-    completions.clear(); native::reap(ring as! i32, completions);
+    completions.clear();
+    if native::reap(ring as! i32, RING_TURN, completions) { more_completions = true; }
+    let reserved = max(0, answers_left - RING_TURN);
+    answers_left -= reserved;
     for event in completions {
         let operation = event.ud >> 56;
         let slot = (event.ud & 0xffff) as! i64;
@@ -355,10 +371,11 @@ fn drain(ring: i64) {
         else if operation == CLOSE { on_close(index, generation); }
         else { assert(operation == SHUTDOWN); }
     }
+    answers_left += reserved;
 }
 
 fn run_ready() {
-    let end = ready.len;
+    let end = min(ready.len, ready_head + answers_left);
     while ready_head < end && answers_left > 0 {
         let h = ready[ready_head]; ready_head++;
         if !live(h) { continue; }
@@ -382,10 +399,11 @@ fn held_writes_due() -> bool {
     return write_deadline != 0 && !db::writes_held() && native::micros() >= write_deadline;
 }
 
-fn release_held() {
-    if !held_writes_due() { return; }
-    let end = held.len;
-    let floor = if ready_head < ready.len { answers_left / 2 } else { 0 };
+fn release_held() -> bool {
+    if !held_writes_due() { return false; }
+    let end = min(held.len, held_head + WRITE_BATCH);
+    let before = answers_left;
+    let floor = max(0, before - WRITE_BATCH);
     while held_head < end && answers_left > floor {
         let h = held[held_head]; held_head++;
         if !live(h) { continue; }
@@ -404,6 +422,7 @@ fn release_held() {
     }
     compact(held, held_head);
     if held.len == 0 { write_deadline = 0; }
+    return held.len > held_head || before - answers_left == WRITE_BATCH;
 }
 
 fn read_rounds(first_ring: i64, reads_left: i64&, pause_for_replies: bool) -> bool {
@@ -412,7 +431,7 @@ fn read_rounds(first_ring: i64, reads_left: i64&, pause_for_replies: bool) -> bo
         let end = reads.len;
         var round = 0;
         while read_head < end && reads_left > 0 {
-            let h = reads[read_head]; read_head++;
+            let h = reads[read_head]; read_head++; reads_left--;
             if !live(h) { continue; }
             let c .= connections[h.index];
             if c.rx != model::Rx.Queued { continue; }
@@ -421,7 +440,7 @@ fn read_rounds(first_ring: i64, reads_left: i64&, pause_for_replies: bool) -> bo
             if (c.flags & (model::CLOSE_AFTER | model::PEER_EOF)) != 0 { c.rx = model::Rx.End; continue; }
             c.rx = model::Rx.Reading; rings[ring].reads++;
             queued(native::read(ring as! i32, (h.index % slots) as! i32, tag(READ, h.index)));
-            reads_left--; round++;
+            round++;
         }
         if round == 0 { break; }
         native::publish();
@@ -430,6 +449,7 @@ fn read_rounds(first_ring: i64, reads_left: i64&, pause_for_replies: bool) -> bo
             queued(native::enter(ring as! i32, false));
             drain(ring);
         }
+        if more_completions || held.len - held_head >= WRITE_BATCH { break; }
     }
     compact(reads, read_head);
     return false;
@@ -527,30 +547,38 @@ fn run() {
     initialize();
     var first_ring: i64 = 0;
     loop {
-        let old_work = ready.len - ready_head + (if held_writes_due() { held.len - held_head } else { 0 });
-        let busy = old_work > 0 || read_head < reads.len;
+        let pending = held.len - held_head;
+        let old_ready = ready.len - ready_head;
+        let busy = more_completions || old_ready > 0 || read_head < reads.len || held_writes_due();
+        more_completions = false;
         var ring = ring_count;
         while ring > 0 { ring--; queued(native::enter(ring as! i32, ring == 0 && !busy)); }
-        answers_left = model::ANSWERS;
-        if old_work > 0 {
-            let reserved = min(model::ANSWERS / 2, old_work);
-            answers_left = reserved;
-            release_held();
+        let write_reserve = if pending > 0 { WRITE_BATCH } else { 0 };
+        answers_left = model::ANSWERS - write_reserve;
+        if old_ready > 0 {
+            let saved = answers_left - min(model::ANSWERS / 2, old_ready);
+            answers_left -= saved;
             run_ready();
-            answers_left += model::ANSWERS - reserved;
+            answers_left += saved;
         }
         for offset in ring_count {
             drain((first_ring + offset) % ring_count);
         }
-        release_held();
         run_ready();
-        var reads_left = model::READS;
+        let backlog = more_completions || ready_head < ready.len || held.len - held_head >= WRITE_BATCH ||
+            reads.len - read_head >= RING_TURN;
+        var reads_left = if backlog { RING_TURN as i64 } else { model::READS };
         let recovery_paused = read_rounds(first_ring, reads_left, true);
+        answers_left += write_reserve;
+        let more_writes = release_held();
         native::publish();
         let committed = native::commit();
         flush(committed);
-        if recovery_paused {
+        if more_writes || more_completions || recovery_paused {
             queued(native::submit_pending());
+        }
+        if recovery_paused {
+            answers_left = 0;
             read_rounds(first_ring, reads_left, false);
             native::publish();
             // The request budget is exhausted, so any remaining output is already committed.

@@ -7,7 +7,7 @@ struct FeedRow { id: i64, likes: i64, body_len: i64, created_len: i64, author_le
 extern fn ring_add(slots: i32) -> i32 = "io_ring_add";
 extern fn enter(ring: i32, wait: bool) -> i32 = "io_enter";
 extern fn submit_pending() -> i32 = "io_submit_pending";
-extern fn reap(ring: i32, out: Cqe[>..]&) = "io_reap";
+extern fn reap(ring: i32, limit: u32, out: Cqe[>..]&) -> bool = "io_reap";
 extern fn accept(ring: i32, listener: i32, ud: u64) -> i32 = "io_accept";
 extern fn cancel_accept(ring: i32, accept_ud: u64, ud: u64) -> i32 = "io_cancel_accept";
 extern fn recv(ring: i32, slot: i32, ud: u64) -> i32 = "io_recv";
